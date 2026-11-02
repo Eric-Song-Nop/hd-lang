@@ -16,6 +16,7 @@
 //! | 5 | repl input | none; entry empty | the input's text (a string), then optionally its number |
 //! | 6 | repl outcome | none; entry empty | the module's number, then one outcome byte |
 //! | 7 | repl rebuild input | none; entry empty | the input's text, then its number; builds a whole linked base |
+//! | 8 | add package | the package's files; entry empty | its name; its identity; a count of required names, then each; a count of host entries, then each trait path and provider path; one byte, 1 when the playground's files may name it |
 //!
 //! WAT requests compile as Run. The worker prints those bytes with the
 //! separate `hd_wat` module, loaded only when the WAT view requests it.
@@ -26,6 +27,10 @@
 //! added for the test goal; a malformed one answers `{"error":"..."}`. The
 //! test goal's programs (the unit-test program, then each integration test
 //! file's) follow one another in the bytes, each as long as its `size`.
+//!
+//! Add package registers a library with the session
+//! ([`Session::add_package`]) for every later compile, and answers
+//! `{"diagnostics":[],"package":NAME}`. REPL sessions do not see it.
 //!
 //! **REPL goals** drive the session's REPL session
 //! ([`Session::repl_start`]), one input per request:
@@ -62,7 +67,7 @@ use std::fmt::Write as _;
 
 use hd_driver::diagnostics::{Diag, quote};
 
-use crate::{CompileResult, Goal, ReplBuild, ReplError, ReplOutcome, Session};
+use crate::{CompileResult, Goal, ReplBuild, ReplError, ReplOutcome, Session, WebPackage};
 
 /// `hd_compile`'s status: compiled, and no diagnostic is an error.
 pub const STATUS_OK: u32 = 0;
@@ -94,6 +99,14 @@ pub enum Action {
     ReplOutcome { input: u32, outcome: ReplOutcome },
     /// Goal byte 7: a whole linked base for a recorded input's replay.
     ReplRebuildInput { text: String, number: u32 },
+    /// Goal byte 8: register the request's files as a package.
+    AddPackage {
+        name: String,
+        identity: String,
+        requires: Vec<String>,
+        hosts: Vec<(String, String)>,
+        direct: bool,
+    },
 }
 
 /// Why a request did not decode.
@@ -125,6 +138,28 @@ pub fn respond(session: &mut Session, request: &[u8]) -> Response {
         } => repl_build(session.repl_input_as(number, &text)),
         Action::ReplRebuildInput { text, number } => {
             repl_build(session.repl_rebuild_input_as(number, &text))
+        }
+        Action::AddPackage {
+            name,
+            identity,
+            requires,
+            hosts,
+            direct,
+        } => {
+            let json = format!("{{\"diagnostics\":[],\"package\":{}}}", quote(&name));
+            session.add_package(WebPackage {
+                name,
+                identity,
+                files: req.files,
+                requires,
+                hosts,
+                direct,
+            });
+            Response {
+                status: STATUS_OK,
+                json,
+                wasm: Vec::new(),
+            }
         }
         Action::ReplOutcome { input, outcome } => match session.repl_outcome(input, outcome) {
             Ok(()) => Response {
@@ -241,6 +276,31 @@ pub fn decode_request(bytes: &[u8]) -> Result<Request, WireError> {
             };
             Action::ReplOutcome { input, outcome }
         }
+        8 => {
+            let name = r.string()?;
+            let identity = r.string()?;
+            let mut requires = Vec::new();
+            for _ in 0..r.leb()? {
+                requires.push(r.string()?);
+            }
+            let mut hosts = Vec::new();
+            for _ in 0..r.leb()? {
+                let trait_path = r.string()?;
+                hosts.push((trait_path, r.string()?));
+            }
+            let direct = match r.byte()? {
+                0 => false,
+                1 => true,
+                _ => return Err(WireError("unknown direct byte")),
+            };
+            Action::AddPackage {
+                name,
+                identity,
+                requires,
+                hosts,
+                direct,
+            }
+        }
         _ => return Err(WireError("unknown goal byte")),
     };
     if r.at != bytes.len() {
@@ -249,7 +309,7 @@ pub fn decode_request(bytes: &[u8]) -> Result<Request, WireError> {
     if byte >= 4 && !entry.is_empty() {
         return Err(WireError("a REPL request has no entry"));
     }
-    if byte >= 5 && !files.is_empty() {
+    if (5..=7).contains(&byte) && !files.is_empty() {
         return Err(WireError("a REPL input or outcome carries no files"));
     }
     Ok(Request {
@@ -723,6 +783,101 @@ mod tests {
         assert_eq!(
             respond(&mut session, &again).json,
             "{\"error\":\"input 8 does not come after input 8\"}"
+        );
+    }
+
+    /// An add package request for `files`, named `name`.
+    fn add_package(
+        files: &[(&str, &str)],
+        name: &str,
+        requires: &[&str],
+        hosts: &[(&str, &str)],
+        direct: bool,
+    ) -> Vec<u8> {
+        let mut out = request(files, "", 8);
+        string(&mut out, name);
+        string(&mut out, &format!("web:{name}"));
+        leb(&mut out, requires.len());
+        for r in requires {
+            string(&mut out, r);
+        }
+        leb(&mut out, hosts.len());
+        for (t, p) in hosts {
+            string(&mut out, t);
+            string(&mut out, p);
+        }
+        out.push(u8::from(direct));
+        out
+    }
+
+    #[test]
+    fn a_program_builds_against_registered_packages() {
+        let mut session = Session::new();
+        // Nothing registered: the path does not resolve.
+        let main = "use dep.greet_lib.{greet}\n\npub fn main() -> void $ Console:\n    println(greet())\n";
+        let files = [("src/main.hd", main)];
+        let cold = respond(&mut session, &request(&files, "src/main.hd", 0));
+        assert_eq!(cold.status, STATUS_ERRORS, "{}", cold.json);
+
+        let base = [("src/lib.hd", "pub fn word() -> string:\n    \"hi\"\n")];
+        let lib = [(
+            "src/lib.hd",
+            "use dep.base.word\n\npub fn greet() -> string:\n    word()\n",
+        )];
+        let answer = respond(&mut session, &add_package(&base, "base", &[], &[], false));
+        assert_eq!(answer.json, "{\"diagnostics\":[],\"package\":\"base\"}");
+        let answer = respond(
+            &mut session,
+            &add_package(&lib, "greet-lib", &["base"], &[], true),
+        );
+        assert_eq!(answer.status, STATUS_OK);
+
+        let run = respond(&mut session, &request(&files, "src/main.hd", 0));
+        assert_eq!(run.status, STATUS_OK, "{}", run.json);
+        assert_eq!(&run.wasm[..4], b"\0asm");
+
+        // A package that is not direct stays out of the playground's reach.
+        let reach = [(
+            "src/main.hd",
+            "use dep.base.word\n\npub fn main() -> void $ Console:\n    println(word())\n",
+        )];
+        let hidden = respond(&mut session, &request(&reach, "src/main.hd", 0));
+        assert_eq!(hidden.status, STATUS_ERRORS, "{}", hidden.json);
+    }
+
+    #[test]
+    fn a_registered_host_trait_reaches_the_contract() {
+        let mut session = Session::new();
+        let surface = [(
+            "src/lib.hd",
+            "@host\npub trait Ping:\n    fn ping!(&mut self) -> i32\n",
+        )];
+        let hosts = [("Ping", "providers/ping.mjs")];
+        respond(
+            &mut session,
+            &add_package(&surface, "pinger", &[], &hosts, true),
+        );
+        let main = "use dep.pinger.Ping\n\npub fn main!() -> void $ Ping + Console:\n    println($.use(Ping).ping!())\n";
+        let run = respond(
+            &mut session,
+            &request(&[("src/main.hd", main)], "src/main.hd", 0),
+        );
+        assert_eq!(run.status, STATUS_OK, "{}", run.json);
+        let artifacts = hd_driver::host_artifacts(&run.wasm).unwrap().unwrap();
+        assert_eq!(artifacts.contract.interfaces.len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_add_package_is_an_error() {
+        let good = add_package(&[("src/lib.hd", "x")], "a", &["b"], &[("T", "p")], true);
+        for end in 0..good.len() {
+            assert!(decode_request(&good[..end]).is_err(), "{end}");
+        }
+        let mut direct = good.clone();
+        *direct.last_mut().unwrap() = 2;
+        assert_eq!(
+            decode_request(&direct),
+            Err(WireError("unknown direct byte"))
         );
     }
 

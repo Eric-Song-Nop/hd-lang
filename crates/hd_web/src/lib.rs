@@ -22,10 +22,13 @@ use hd_base::SliceSort as _;
 use hd_cache::MemoryStore;
 use hd_driver::diagnostics::{Diag, from_output};
 use hd_driver::{
-    BuildProfile, Counters, EngineTarget, Executor, Host, NoClock, OptLevel, Packages, TestCase,
-    build_packages, test_programs,
+    BuildProfile, Counters, Dependency, EngineTarget, Executor, Host, HostPackage, NoClock,
+    OptLevel, Packages, TestCase, build_packages, test_programs,
 };
-use hd_project::{MemorySources, Root, in_program, module_below, repl_file, repl_input};
+use hd_project::{
+    HostDeclarations, HostProvider, MemorySources, Root, in_program, module_below, package_ident,
+    repl_file, repl_input,
+};
 use hd_sched::SerialOrder;
 
 pub mod wire;
@@ -153,11 +156,32 @@ struct Repl {
     pending: Option<hd_driver::Session>,
 }
 
+/// A library a session's compiles can depend on, as a path dependency in a
+/// manifest would be (`crates/hd_web/DESIGN.md` §3.1).
+pub struct WebPackage {
+    /// Its manifest name; source names it `dep.` and the identifier form.
+    pub name: String,
+    /// What tells it from another package of the same name. It fixes the
+    /// ABI identity of the package's host traits, so generated glue stays
+    /// valid across compiles.
+    pub identity: String,
+    /// Its files, package-relative.
+    pub files: Vec<(String, String)>,
+    /// The manifest names of the packages it requires, each registered.
+    pub requires: Vec<String>,
+    /// Its `[host]` table: each trait path and its provider's path.
+    pub hosts: Vec<(String, String)>,
+    /// Whether the playground's own files may name it with `dep.`.
+    pub direct: bool,
+}
+
 /// One playground worker's state.
 #[derive(Default)]
 pub struct Session {
     /// The files of the last compile.
     sources: MemorySources,
+    /// The libraries each compile can depend on, with their sources.
+    packages: Vec<(WebPackage, MemorySources)>,
     store: MemoryStore,
     /// The REPL session, once one started.
     repl: Option<Repl>,
@@ -167,6 +191,82 @@ impl Session {
     #[must_use]
     pub fn new() -> Session {
         Session::default()
+    }
+
+    /// Registers `package` for the compiles after this one, replacing a
+    /// package of the same name.
+    pub fn add_package(&mut self, package: WebPackage) {
+        let mut sources = MemorySources::default();
+        for (path, text) in &package.files {
+            sources.insert(path, text);
+        }
+        self.packages.retain(|(p, _)| p.name != package.name);
+        self.packages.push((package, sources));
+    }
+
+    /// The package index of `name`: registered package `i` is `i + 1`, as
+    /// in [`Packages::requires`].
+    fn package_index(&self, name: &str) -> Option<u16> {
+        let at = self.packages.iter().position(|(p, _)| p.name == name)?;
+        u16::try_from(at + 1).ok()
+    }
+
+    /// The registered packages' requirement edges for one package's
+    /// `names`; a name no package answers to is left out, and the build
+    /// reports the `dep.` path that reaches for it.
+    fn edges<'a>(&self, names: impl Iterator<Item = &'a str>) -> Vec<(String, u16)> {
+        names
+            .filter_map(|name| Some((package_ident(name), self.package_index(name)?)))
+            .collect()
+    }
+
+    /// The registered packages' dependencies, host tables and root edges.
+    fn dependencies(&self) -> (Vec<Dependency<'_>>, Vec<HostPackage>, Vec<(String, u16)>) {
+        let deps = self
+            .packages
+            .iter()
+            .map(|(p, sources)| Dependency {
+                name: p.name.clone(),
+                identity: p.identity.clone(),
+                sources,
+                requires: self.edges(p.requires.iter().map(String::as_str)),
+                fetched: false,
+            })
+            .collect();
+        let hosts = self
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, _))| !p.hosts.is_empty())
+            .filter_map(|(at, (p, _))| {
+                Some(HostPackage {
+                    package: u16::try_from(at + 1).ok()?,
+                    identity: p.identity.clone(),
+                    versioned_source: None,
+                    declarations: Some(HostDeclarations {
+                        providers: Some(
+                            p.hosts
+                                .iter()
+                                .map(|(trait_path, path)| HostProvider {
+                                    trait_path: trait_path.clone(),
+                                    path: Some(path.clone()),
+                                    line: 0,
+                                })
+                                .collect(),
+                        ),
+                        line: 0,
+                    }),
+                    manifest: format!("{}/hd.toml", p.name),
+                })
+            })
+            .collect();
+        let requires = self.edges(
+            self.packages
+                .iter()
+                .filter(|(p, _)| p.direct)
+                .map(|(p, _)| p.name.as_str()),
+        );
+        (deps, hosts, requires)
     }
 
     /// Compiles `files`, each a playground path (`src/main.hd`) and its
@@ -196,8 +296,12 @@ impl Session {
         }
         // One file outside the `src` layout is a single-file program, as
         // `hd FILE.hd` builds a file with no `hd.toml` above it.
+        let (deps, host_packages, requires) = self.dependencies();
         let packages = Packages {
             single_file: count == 1 && Root::of(entry).0 == Root::Flat,
+            deps,
+            host_packages,
+            requires,
             target: PIPELINE.0,
             level: PIPELINE.1,
             ..Packages::default()
